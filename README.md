@@ -8,6 +8,22 @@ Each key is deterministically assigned to a bucket. Every bucket has an independ
 schema name → FNV-1a hash → bucket → permit → database query
 ```
 
+```mermaid
+flowchart LR
+    A[Schema requests] --> H[FNV-1a hash]
+    H --> B0[Bucket 0]
+    H --> B1[Bucket 1]
+    H --> BN[Bucket N]
+    B0 --> P[(pgxpool)]
+    B1 --> P
+    BN --> P
+
+    classDef healthy fill:#0b3b5a,stroke:#2dd4ef,color:#ecfeff
+    classDef pool fill:#172554,stroke:#60a5fa,color:#eff6ff
+    class B0,B1,BN healthy
+    class P pool
+```
+
 ## Usage
 
 Create one pool and acquire a permit before calling `pgxpool`:
@@ -80,3 +96,7 @@ golangci-lint run
 ```
 
 On an Intel Core i7-9750H with Go 1.21, uncontended `Acquire` plus `Release` measured approximately 25–28 ns/op with 0 B/op and 0 allocations/op. Benchmark results depend on the machine and Go version.
+
+## License
+
+[MIT](LICENSE)
