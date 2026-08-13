@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+.vscode/
+.codex/
+openspec/
+*.out
+coverage.txt
+permit-pool.test
