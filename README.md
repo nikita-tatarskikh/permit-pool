@@ -91,9 +91,15 @@ Do not copy a permit, pass it by value, store value copies, or call `Release` co
 ```sh
 go test ./...
 go test -race ./...
+go test -tags=integration -run '^TestIntegration' -v
 go test -run '^$' -bench . -benchmem -count 5
 golangci-lint run
 ```
+
+The integration tests require a running Docker daemon. They start an ephemeral
+`postgres:16-alpine` container and remove it after the test run. The tests first
+reproduce `pgxpool` exhaustion without admission control, then verify that a
+table lock in one permit bucket does not stop a query assigned to another bucket.
 
 On an Intel Core i7-9750H with Go 1.21, uncontended `Acquire` plus `Release` measured approximately 25–28 ns/op with 0 B/op and 0 allocations/op. Benchmark results depend on the machine and Go version.
 
