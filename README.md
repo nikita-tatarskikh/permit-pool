@@ -46,7 +46,14 @@ defer permit.Release()
 return queryDatabase(ctx, schema)
 ```
 
-The context controls how long acquisition may wait. A cancelled acquisition does not consume capacity.
+The context controls the entire acquisition attempt, including retries after
+atomic contention. Once acquisition observes cancellation, it stops trying to
+obtain capacity. If cancellation is observed immediately after capacity was
+claimed, that capacity is returned before `Acquire` reports the context error.
+
+The final context check is the ownership boundary: cancellation that happens
+after that check may race with a successful return, in which case the caller
+owns the returned permit and must release it normally.
 
 Acquire the permit before requesting a database connection. Release it only after the operation can no longer retain that connection. For streaming rows, this means holding the permit until the rows are exhausted or closed.
 

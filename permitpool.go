@@ -39,6 +39,14 @@ type bucket struct {
 	_ [cacheLinePadding]byte
 }
 
+type acquireResult uint8
+
+const (
+	acquireUnavailable acquireResult = iota
+	acquireSucceeded
+	acquireCancelled
+)
+
 // Pool is a fixed collection of independently limited hash buckets.
 type Pool struct {
 	buckets    []bucket
@@ -72,8 +80,7 @@ func (p *Permit) Release() {
 	}
 
 	p.released = true
-	p.bucket.available.Add(1)
-	p.bucket.notifyWaiter()
+	p.bucket.release()
 }
 
 // New constructs an immutable permit pool.
@@ -116,12 +123,12 @@ func (p *Pool) Bucket(schema string) int {
 // Acquire waits for capacity in schema's bucket. It does not acquire a
 // database connection. A successful call returns a live, single-owner Permit.
 func (p *Pool) Acquire(ctx context.Context, schema string) (Permit, error) {
-	if err := ctx.Err(); err != nil {
-		return Permit{}, err
-	}
 	bucket := &p.buckets[p.Bucket(schema)]
-	if bucket.tryAcquire() {
+	switch bucket.tryAcquire(ctx) {
+	case acquireSucceeded:
 		return Permit{bucket: bucket}, nil
+	case acquireCancelled:
+		return Permit{}, ctx.Err()
 	}
 
 	return acquireSlow(ctx, bucket)
@@ -131,9 +138,16 @@ func (p *Pool) Acquire(ctx context.Context, schema string) (Permit, error) {
 // inlineable. It is reached only when a bucket is saturated.
 func acquireSlow(ctx context.Context, bucket *bucket) (Permit, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return Permit{}, err
+		}
+
 		select {
 		case <-bucket.wake:
-			if !bucket.tryAcquire() {
+			switch bucket.tryAcquire(ctx) {
+			case acquireCancelled:
+				return Permit{}, ctx.Err()
+			case acquireUnavailable:
 				continue
 			}
 
@@ -149,16 +163,34 @@ func acquireSlow(ctx context.Context, bucket *bucket) (Permit, error) {
 	}
 }
 
-func (b *bucket) tryAcquire() bool {
+func (b *bucket) tryAcquire(ctx context.Context) acquireResult {
 	for available := b.available.Load(); available > 0; {
+		if ctx.Err() != nil {
+			return acquireCancelled
+		}
+
 		if b.available.CompareAndSwap(available, available-1) {
-			return true
+			if ctx.Err() != nil {
+				b.release()
+				return acquireCancelled
+			}
+
+			return acquireSucceeded
 		}
 
 		available = b.available.Load()
 	}
 
-	return false
+	if ctx.Err() != nil {
+		return acquireCancelled
+	}
+
+	return acquireUnavailable
+}
+
+func (b *bucket) release() {
+	b.available.Add(1)
+	b.notifyWaiter()
 }
 
 func (b *bucket) notifyWaiter() {

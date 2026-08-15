@@ -10,6 +10,24 @@ import (
 	"time"
 )
 
+type checkingContext struct {
+	context.Context
+	cancelAt int64
+	checks   atomic.Int64
+	onCheck  func(int64)
+}
+
+func (c *checkingContext) Err() error {
+	check := c.checks.Add(1)
+	if c.onCheck != nil {
+		c.onCheck(check)
+	}
+	if check >= c.cancelAt {
+		return context.Canceled
+	}
+	return nil
+}
+
 func newTestPool(t *testing.T, buckets, permits int) *Pool {
 	t.Helper()
 	pool, err := New(Config{BucketCount: buckets, PermitsPerBucket: permits})
@@ -159,6 +177,72 @@ func TestCanceledContextsDoNotConsumeCapacity(t *testing.T) {
 	release.Release()
 }
 
+func TestTryAcquireStopsAfterCancellationBetweenAtomicAttempts(t *testing.T) {
+	bucket := &bucket{wake: make(chan struct{}, 1)}
+	bucket.available.Store(1)
+	ctx := &checkingContext{
+		Context:  context.Background(),
+		cancelAt: 2,
+		onCheck: func(check int64) {
+			if check == 1 {
+				// Invalidate the value loaded by tryAcquire so its first CAS
+				// fails. Cancellation must be observed before another CAS.
+				bucket.available.Store(2)
+			}
+		},
+	}
+
+	if got := bucket.tryAcquire(ctx); got != acquireCancelled {
+		t.Fatalf("tryAcquire() = %v, want acquireCancelled", got)
+	}
+	if got := bucket.available.Load(); got != 2 {
+		t.Fatalf("available = %d, want 2; acquisition continued after cancellation", got)
+	}
+}
+
+func TestTryAcquireRestoresCapacityWhenFinalCheckObservesCancellation(t *testing.T) {
+	bucket := &bucket{wake: make(chan struct{}, 1)}
+	bucket.available.Store(1)
+	ctx := &checkingContext{Context: context.Background(), cancelAt: 2}
+
+	if got := bucket.tryAcquire(ctx); got != acquireCancelled {
+		t.Fatalf("tryAcquire() = %v, want acquireCancelled", got)
+	}
+	if got := bucket.available.Load(); got != 1 {
+		t.Fatalf("available after cancelled acquisition = %d, want 1", got)
+	}
+}
+
+func TestWaitingAcquireCancellationPrecedesReadyWake(t *testing.T) {
+	pool := newTestPool(t, 1, 1)
+	held, err := pool.Acquire(context.Background(), "schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		permit, acquireErr := pool.Acquire(ctx, "schema")
+		if permit.bucket != nil {
+			permit.Release()
+		}
+		result <- acquireErr
+	}()
+
+	cancel()
+	held.Release()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Acquire() error = %v, want context.Canceled", err)
+	}
+
+	permit, err := pool.Acquire(context.Background(), "schema")
+	if err != nil {
+		t.Fatalf("capacity leaked after wake/cancel race: %v", err)
+	}
+	permit.Release()
+}
+
 func TestReleaseIsIdempotent(t *testing.T) {
 	pool := newTestPool(t, 1, 1)
 	release, _ := pool.Acquire(context.Background(), "schema")
@@ -180,18 +264,32 @@ func TestAcquireCancelReleaseRace(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		held, _ := pool.Acquire(context.Background(), "schema")
 		ctx, cancel := context.WithCancel(context.Background())
-		result := make(chan Permit, 1)
+		type acquireResult struct {
+			permit Permit
+			err    error
+		}
+		result := make(chan acquireResult, 1)
 		done := make(chan struct{})
 		go func() {
-			release, _ := pool.Acquire(ctx, "schema")
-			result <- release
+			permit, err := pool.Acquire(ctx, "schema")
+			result <- acquireResult{permit: permit, err: err}
 			close(done)
 		}()
 		go cancel()
 		held.Release()
 		<-done
-		if permit := <-result; permit.bucket != nil {
-			permit.Release()
+		got := <-result
+		if got.err != nil && !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("Acquire() error = %v", got.err)
+		}
+		if got.err != nil && got.permit.bucket != nil {
+			t.Fatal("cancelled Acquire returned a live permit")
+		}
+		if got.permit.bucket != nil {
+			got.permit.Release()
+		}
+		if available := pool.buckets[0].available.Load(); available != 1 {
+			t.Fatalf("available after race = %d, want 1", available)
 		}
 	}
 	release, err := pool.Acquire(context.Background(), "schema")
